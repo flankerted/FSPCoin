@@ -1,0 +1,327 @@
+// Copyright 2014 The go-contatract Authors
+// This file is part of the go-contatract library.
+//
+// The go-contatract library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-contatract library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-contatract library. If not, see <http://www.gnu.org/licenses/>.
+
+// Package eth implements the Ethereum protocol.
+package elephant
+
+import (
+	"errors"
+	"fmt"
+	//"math/big"
+	"runtime"
+	"sync"
+	"sync/atomic"
+
+	"github.com/contatract/go-contatract/accounts"
+	"github.com/contatract/go-contatract/common"
+	"github.com/contatract/go-contatract/common/hexutil"
+	"github.com/contatract/go-contatract/consensus"
+	"github.com/contatract/go-contatract/consensus/elephanthash"
+	//"github.com/contatract/go-contatract/consensus/elephanthash"
+	core"github.com/contatract/go-contatract/core_elephant"
+	//"github.com/contatract/go-contatract/core/bloombits"
+	"github.com/contatract/go-contatract/core/types"
+	//"github.com/contatract/go-contatract/core/vm"
+	downloader"github.com/contatract/go-contatract/elephant/downloader"
+	//"github.com/contatract/go-contatract/elephant/filters"
+	//"github.com/contatract/go-contatract/elephant/gasprice"
+	"github.com/contatract/go-contatract/ethdb"
+	"github.com/contatract/go-contatract/event"
+	//"github.com/contatract/go-contatract/internal/ethapi"
+	"github.com/contatract/go-contatract/log"
+	miner"github.com/contatract/go-contatract/miner_elephant"
+	"github.com/contatract/go-contatract/node"
+	"github.com/contatract/go-contatract/p2p"
+	"github.com/contatract/go-contatract/params"
+	"github.com/contatract/go-contatract/rlp"
+	"github.com/contatract/go-contatract/rpc"
+)
+
+// Ethereum implements the Ethereum full node service.
+type Elephant struct {
+	config      *Config
+	chainConfig *params.ChainConfig
+
+	// Channel for shutting down the service
+	shutdownChan  chan bool    // Channel for shutting down the ethereum
+	stopDbUpgrade func() error // stop chain db sequential key upgrade
+
+	// Handlers
+	txPool          *core.TxPool
+	blockchain      *core.BlockChain
+	protocolManager *ProtocolManager
+
+	// DB interfaces
+	chainDb ethdb.Database // Block chain database
+
+	eventMux       *event.TypeMux
+	engine         consensus.Engine
+	accountManager *accounts.Manager
+
+	miner     *miner.Miner
+	etherbase common.Address
+
+	networkId     uint64
+
+	lock sync.RWMutex // Protects the variadic fields (e.g. gas price and etherbase)
+}
+
+
+// New creates a new Ethereum object (including the
+// initialisation of the common Ethereum object)
+func New(ctx *node.ServiceContext, config *Config) (*Elephant, error) {
+	if config.SyncMode == downloader.LightSync {
+		return nil, errors.New("can't run elephant.Elephant in light sync mode, use les.LightEthereum")
+	}
+	if !config.SyncMode.IsValid() {
+		return nil, fmt.Errorf("invalid sync mode %d", config.SyncMode)
+	}
+	chainDb, err := CreateDB(ctx, config, "elephantdata")
+	if err != nil {
+		return nil, err
+	}
+	stopDbUpgrade := upgradeDeduplicateData(chainDb)
+	chainConfig, genesisHash, genesisErr := core.SetupGenesisBlock(chainDb, config.Genesis)
+	if _, ok := genesisErr.(*params.ConfigCompatError); genesisErr != nil && !ok {
+		return nil, genesisErr
+	}
+	log.Info("Initialised chain configuration", "config", chainConfig)
+
+	elephant := &Elephant{
+		config:         config,
+		chainDb:        chainDb,
+		chainConfig:    chainConfig,
+		eventMux:       ctx.EventMux,
+		//accountManager: ctx.AccountManager,
+		engine:         CreateConsensusEngine(ctx, &config.Elephanthash, chainConfig, chainDb),
+		shutdownChan:   make(chan bool),
+		stopDbUpgrade:  stopDbUpgrade,
+		networkId:      config.NetworkId,
+		etherbase:      config.Etherbase,
+	}
+
+	log.Info("Initialising Elephant protocol", "versions", ProtocolVersions, "network", config.NetworkId)
+
+	if !config.SkipBcVersionCheck {
+		bcVersion := core.GetBlockChainVersion(chainDb)
+		if bcVersion != core.BlockChainVersion && bcVersion != 0 {
+			return nil, fmt.Errorf("Blockchain DB version mismatch (%d / %d). Run geth upgradedb.\n", bcVersion, core.BlockChainVersion)
+		}
+		core.WriteBlockChainVersion(chainDb, core.BlockChainVersion)
+	}
+	var (
+		cacheConfig = &core.CacheConfig{Disabled: config.NoPruning, TrieNodeLimit: config.TrieCache, TrieTimeLimit: config.TrieTimeout}
+	)
+	elephant.blockchain, err = core.NewBlockChain(chainDb, cacheConfig, elephant.chainConfig, elephant.engine)
+	if err != nil {
+		return nil, err
+	}
+	// Rewind the chain in case of an incompatible config upgrade.
+	if compat, ok := genesisErr.(*params.ConfigCompatError); ok {
+		log.Warn("Rewinding chain to upgrade configuration", "err", compat)
+		elephant.blockchain.SetHead(compat.RewindTo)
+		core.WriteChainConfig(chainDb, genesisHash, chainConfig)
+	}
+	
+	//elephant.bloomIndexer.Start(eth.blockchain)
+
+	if config.TxPool.Journal != "" {
+		config.TxPool.Journal = ctx.ResolvePath(config.TxPool.Journal)
+	}
+	elephant.txPool = core.NewTxPool(config.TxPool, elephant.chainConfig, elephant.blockchain)
+
+	if elephant.protocolManager, err = NewProtocolManager(elephant.chainConfig, config.SyncMode, config.NetworkId, elephant.eventMux, elephant.txPool, elephant.engine, elephant.blockchain, chainDb); err != nil {
+		return nil, err
+	}
+	elephant.miner = miner.New(elephant, elephant.chainConfig, elephant.EventMux(), elephant.engine)
+	elephant.miner.SetExtra(makeExtraData(config.ExtraData))
+
+	return elephant, nil
+}
+
+func makeExtraData(extra []byte) []byte {
+	if len(extra) == 0 {
+		// create default extradata
+		extra, _ = rlp.EncodeToBytes([]interface{}{
+			uint(params.VersionMajor<<16 | params.VersionMinor<<8 | params.VersionPatch),
+			"geth",
+			runtime.Version(),
+			runtime.GOOS,
+		})
+	}
+	if uint64(len(extra)) > params.MaximumExtraDataSize {
+		log.Warn("Miner extra data exceed limit", "extra", hexutil.Bytes(extra), "limit", params.MaximumExtraDataSize)
+		extra = nil
+	}
+	return extra
+}
+
+// CreateDB creates the chain database.
+func CreateDB(ctx *node.ServiceContext, config *Config, name string) (ethdb.Database, error) {
+	db, err := ctx.OpenDatabase(name, config.DatabaseCache, config.DatabaseHandles)
+	if err != nil {
+		return nil, err
+	}
+	if db, ok := db.(*ethdb.LDBDatabase); ok {
+		db.Meter("eth/db/chaindata/")
+	}
+	return db, nil
+}
+
+// CreateConsensusEngine creates the required type of consensus engine instance for an Ethereum service
+func CreateConsensusEngine(ctx *node.ServiceContext, config *elephanthash.Config, chainConfig *params.ChainConfig, db ethdb.Database) consensus.Engine {
+
+	// Otherwise assume proof-of-work
+	switch {
+	case config.PowMode == elephanthash.ModeFake:
+		log.Warn("Elephanthash used in fake mode")
+		return nil //elephanthash.NewFaker()
+	case config.PowMode == elephanthash.ModeTest:
+		log.Warn("Elephanthash used in test mode")
+		return nil //elephanthash.NewTester()
+	case config.PowMode == elephanthash.ModeShared:
+		log.Warn("Ethash used in shared mode")
+		return nil //elephanthash.NewShared()
+	default:
+		engine := elephanthash.New(elephanthash.Config{
+			DatasetDir:     config.DatasetDir,
+		})
+		return engine
+	}
+}
+
+// APIs returns the collection of RPC services the ethereum package offers.
+// NOTE, some of these services probably need to be moved to somewhere else.
+func (s *Elephant) APIs() []rpc.API {
+	apis := []rpc.API{};//ethapi.GetAPIs(s.ApiBackend)
+
+	// Append any APIs exposed explicitly by the consensus engine
+	apis = append(apis, s.engine.APIs(s.BlockChain())...)
+
+	// Append all the local APIs and return
+	return append(apis, []rpc.API{}...)
+}
+
+func (s *Elephant) ResetWithGenesisBlock(gb *types.Block) {
+	s.blockchain.ResetWithGenesisBlock(gb)
+}
+
+func (s *Elephant) Etherbase() (eb common.Address, err error) {
+	s.lock.RLock()
+	etherbase := s.etherbase
+	s.lock.RUnlock()
+
+	if etherbase != (common.Address{}) {
+		return etherbase, nil
+	}
+	if wallets := s.AccountManager().Wallets(); len(wallets) > 0 {
+		if accounts := wallets[0].Accounts(); len(accounts) > 0 {
+			etherbase := accounts[0].Address
+
+			s.lock.Lock()
+			s.etherbase = etherbase
+			s.lock.Unlock()
+
+			log.Info("Etherbase automatically configured", "address", etherbase)
+			return etherbase, nil
+		}
+	}
+	return common.Address{}, fmt.Errorf("etherbase must be explicitly specified")
+}
+
+// set in js console via admin interface or wrapper from cli flags
+func (self *Elephant) SetEtherbase(etherbase common.Address) {
+	self.lock.Lock()
+	self.etherbase = etherbase
+	self.lock.Unlock()
+
+	self.miner.SetEtherbase(etherbase)
+}
+
+func (s *Elephant) StartMining(local bool) error {
+	eb, err := s.Etherbase()
+	if err != nil {
+		log.Error("Cannot start mining without etherbase", "err", err)
+		return fmt.Errorf("etherbase missing: %v", err)
+	}
+	
+	if local {
+		// If local (CPU) mining is started, we can disable the transaction rejection
+		// mechanism introduced to speed sync times. CPU mining on mainnet is ludicrous
+		// so noone will ever hit this path, whereas marking sync done on CPU mining
+		// will ensure that private networks work in single miner mode too.
+		atomic.StoreUint32(&s.protocolManager.acceptTxs, 1)
+	}
+	go s.miner.Start(eb)
+	return nil
+}
+
+func (s *Elephant) StopMining()         { s.miner.Stop() }
+func (s *Elephant) IsMining() bool      { return s.miner.Mining() }
+func (s *Elephant) Miner() *miner.Miner { return s.miner }
+
+func (s *Elephant) AccountManager() *accounts.Manager  { return s.accountManager }
+func (s *Elephant) BlockChain() *core.BlockChain       { return s.blockchain }
+func (s *Elephant) TxPool() *core.TxPool               { return s.txPool }
+func (s *Elephant) EventMux() *event.TypeMux           { return s.eventMux }
+func (s *Elephant) Engine() consensus.Engine           { return s.engine }
+func (s *Elephant) ChainDb() ethdb.Database            { return s.chainDb }
+func (s *Elephant) IsListening() bool                  { return true } // Always listening
+func (s *Elephant) EthVersion() int                    { return int(s.protocolManager.SubProtocols[0].Version) }
+func (s *Elephant) NetVersion() uint64                 { return s.networkId }
+func (s *Elephant) Downloader() *downloader.Downloader { return s.protocolManager.downloader }
+
+// Protocols implements node.Service, returning all the currently configured
+// network protocols to start.
+func (s *Elephant) Protocols() []p2p.Protocol {
+	return s.protocolManager.SubProtocols
+}
+
+// Start implements node.Service, starting all internal goroutines needed by the
+// Ethereum protocol implementation.
+func (s *Elephant) Start(srvr *p2p.Server) error {
+
+	// Start the RPC service
+	// s.netRPCService = ethapi.NewPublicNetAPI(srvr, s.NetVersion())
+
+	// Figure out a max peers count based on the server limits
+	maxPeers := srvr.MaxPeers
+
+	// Start the networking layer and the light server if requested
+	s.protocolManager.Start(maxPeers)
+
+	return nil
+}
+
+// Stop implements node.Service, terminating all internal goroutines used by the
+// Ethereum protocol.
+func (s *Elephant) Stop() error {
+	if s.stopDbUpgrade != nil {
+		s.stopDbUpgrade()
+	}
+
+	s.blockchain.Stop()
+	s.protocolManager.Stop()
+
+	s.txPool.Stop()
+	s.miner.Stop()
+	s.eventMux.Stop()
+
+	s.chainDb.Close()
+	close(s.shutdownChan)
+
+	return nil
+}

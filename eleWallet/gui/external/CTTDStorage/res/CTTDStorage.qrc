@@ -1,0 +1,45 @@
+<RCC>
+    <qresource prefix="/">
+        <file>qml/login.qml</file>
+        <file>lang/en_US.qm</file>
+        <file>images/login/icon-close.png</file>
+        <file>images/login/icon-user.png</file>
+        <file>images/login/icon-downArrow.png</file>
+        <file>qml/dataDir.qml</file>
+        <file>qml/newAcc.qml</file>
+        <file>qml/mainWindow.qml</file>
+        <file>qml/popup.qml</file>
+        <file>images/popup/icon-send.png</file>
+        <file>qml/agentConn.qml</file>
+        <file>images/main/icon-refresh.png</file>
+        <file>images/main/icon-search.png</file>
+        <file>images/main/icon-space.png</file>
+        <file>images/main/icon-sharing.png</file>
+        <file>images/main/icon-download.png</file>
+        <file>images/main/icon-upload.png</file>
+        <file>images/main/icon-settings.png</file>
+        <file>qml/createSpace.qml</file>
+        <file>qml/downloadDlg.qml</file>
+        <file>images/download/icon-file.png</file>
+        <file>qml/sharingWindow.qml</file>
+        <file>qml/sendTx.qml</file>
+        <file>qml/getAttachment.qml</file>
+        <file>qml/addAttachment.qml</file>
+        <file>images/login/icon-pwd.png</file>
+        <file>images/main/icon-wemore.png</file>
+        <file>images/main/icon-minimize.png</file>
+        <file>images/main/icon-completed.png</file>
+        <file>images/main/icon-attachment.png</file>
+        <file>images/main/icon-read.png</file>
+        <file>images/main/icon-return.png</file>
+        <file>images/main/icon-user.png</file>
+        <file>images/main/icon-recvMail.png</file>
+        <file>images/main/icon-sendMail.png</file>
+        <file>images/main/icon-fromSharing.png</file>
+        <file>images/ad/gif-candycn.gif</file>
+        <file>images/ad/gif-candyen.gif</file>
+        <file>images/main/icon-wemore.ico</file>
+        <file>images/main/icon-lock.png</file>
+        <file>images/main/icon-unlock.png</file>
+    </qresource>
+</RCC>

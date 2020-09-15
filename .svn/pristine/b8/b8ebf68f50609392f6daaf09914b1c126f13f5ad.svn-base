@@ -1,0 +1,13 @@
+cd config
+../build/bin/gctt --datadir chaindata init genesis.json
+../build/bin/gctt --datadir chaindata --networkid 1104 --rpc console --rpcapi "eth,net,web3,db,personal"
+personal.newAccount("block")
+miner.setEtherbase(eth.accounts[0])
+miner.start(1)
+
+eth.getBalance(personal.listAccounts[0])
+personal.unlockAccount(personal.listAccounts[0], "block")
+eth.sendTransaction({from : personal.listAccounts[0], to : personal.listAccounts[1], value : web3.toWei(3, "ether")})
+admin.nodeInfo
+web3.fromWei(eth.getBalance(personal.listAccounts[0]), "ether")
+
